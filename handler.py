@@ -138,7 +138,7 @@ def ocr_image(image: Image.Image) -> str:
 
 
 # ===============================
-# HANDLER (IMAGE ONLY → TEXT ONLY)
+# HANDLER (IMAGE ONLY → TEXT ON LY)
 # ===============================
 def handler(event):
     load_model()
