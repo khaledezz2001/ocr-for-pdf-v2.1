@@ -56,6 +56,30 @@ def is_hallucinated_output(text: str) -> bool:
     if not text or len(text.strip()) < 10:
         return True
     
+    text_lower = text.lower()
+    
+    # Common hallucination phrases that models generate for empty pages
+    hallucination_indicators = [
+        "table 1:",
+        "comparison of different methods",
+        "note: the choice of method",
+        "this page is blank",
+        "no text found",
+        "empty page",
+        "the image appears to be",
+        "there is no visible text",
+        "the document appears to be blank",
+        "i cannot see any text",
+        "method | accuracy | speed",
+        "soil moisture",
+        "time domain reflectometry"
+    ]
+    
+    # Check if text contains hallucination phrases
+    for indicator in hallucination_indicators:
+        if indicator in text_lower:
+            return True
+    
     # Check for repetitive table patterns
     lines = text.strip().split('\n')
     if len(lines) > 20:
@@ -63,10 +87,28 @@ def is_hallucinated_output(text: str) -> bool:
         if len(unique_lines) < 3:
             return True
     
-    # Check for excessive markdown tables with no content
+    # Check for excessive markdown tables (generic hallucinations)
     table_markers = text.count('|')
-    if table_markers > 50 and len(text.replace('|', '').replace('\n', '').strip()) < 50:
-        return True
+    pipe_lines = sum(1 for line in lines if '|' in line)
+    
+    # If more than 50% of lines have pipes, likely a hallucinated table
+    if len(lines) > 0 and pipe_lines / len(lines) > 0.5:
+        # Check if it's a real table with actual content or generic hallucination
+        content_without_pipes = text.replace('|', '').replace('-', '').replace('\n', '').strip()
+        if len(content_without_pipes) < 100:  # Too little actual content
+            return True
+    
+    # Check for suspiciously perfect table formatting (hallucination signature)
+    if table_markers > 10:
+        # Real tables usually have irregular content
+        # Hallucinated tables often have very uniform structure
+        table_rows = [line for line in lines if '|' in line]
+        if len(table_rows) > 3:
+            # Count pipes per row
+            pipe_counts = [line.count('|') for line in table_rows]
+            # If all rows have exactly the same number of pipes, suspicious
+            if len(set(pipe_counts)) == 1 and pipe_counts[0] > 3:
+                return True
     
     # Check for only special characters
     alphanumeric_chars = sum(c.isalnum() for c in text)
@@ -151,9 +193,13 @@ def ocr_page(image: Image.Image) -> str:
                         "- All numbers, dates, and codes EXACTLY as shown\n"
                         "- All names, addresses, and contact information\n"
                         "- All signatures, stamps, and annotations\n"
-                        "- Preserve original spelling and formatting\n"
+                        "- Preserve original spelling and formatting\n\n"
+                        "CRITICAL RULES:\n"
                         "- Do NOT correct typos or translate anything\n"
                         "- Do NOT add interpretations or summaries\n"
+                        "- Do NOT make up content if the page is blank or empty\n"
+                        "- If the page is truly empty, output only: EMPTY_PAGE\n"
+                        "- Do NOT create tables, examples, or sample data\n\n"
                         "Return ONLY the extracted text, nothing else."
                     )
                 }
@@ -241,8 +287,11 @@ def handler(event):
             # Remove prefix
             text = text.replace(PREFIX, "", 1).strip()
             
+            # Check if model explicitly said it's empty
+            if text.upper() == "EMPTY_PAGE" or text.upper().startswith("EMPTY_PAGE"):
+                text = "[Empty or unreadable page]"
             # Detect hallucinations
-            if is_hallucinated_output(text):
+            elif is_hallucinated_output(text):
                 log(f"Warning: Page {i} appears to be hallucinated")
                 text = "[Empty or unreadable page]"
             
