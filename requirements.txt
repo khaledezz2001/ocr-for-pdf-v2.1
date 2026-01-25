@@ -1,9 +1,12 @@
-torch==2.8.0
-torchvision==0.23.0
-transformers
-accelerate
-pillow
-huggingface_hub
+torch==2.5.1
+torchvision==0.20.1
+transformers>=4.46.0
+accelerate>=0.34.0
+pillow>=10.0.0
+huggingface_hub>=0.26.0
 protobuf
 numpy<2.0
 runpod
+flash-attn>=2.7.0  # For Flash Attention 2 speedup
+sentencepiece  # Often needed for tokenizers
+einops  # Common dependency
