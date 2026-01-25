@@ -48,18 +48,47 @@ def log(msg):
 
 
 # ===============================
-# IMAGE DECODING (OPTIMIZED)
+# HALLUCINATION DETECTION
+# ===============================
+def is_hallucinated_output(text: str) -> bool:
+    """Detect if the OCR output is hallucinated/garbage"""
+    if not text or len(text.strip()) < 10:
+        return True
+    
+    # Check for repetitive table patterns (like page 13)
+    lines = text.strip().split('\n')
+    if len(lines) > 20:
+        # Check if most lines are identical or very similar
+        unique_lines = set(line.strip() for line in lines if line.strip())
+        if len(unique_lines) < 3:  # Too repetitive
+            return True
+    
+    # Check for excessive markdown tables with no content
+    table_markers = text.count('|')
+    if table_markers > 50 and len(text.replace('|', '').replace('\n', '').strip()) < 50:
+        return True
+    
+    # Check for only special characters
+    alphanumeric_chars = sum(c.isalnum() for c in text)
+    if alphanumeric_chars < 10:
+        return True
+    
+    return False
+
+
+# ===============================
+# IMAGE DECODING (ACCURACY OPTIMIZED)
 # ===============================
 def decode_image(b64):
     img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
     
-    # Optimized resize for speed
-    target_width = 1280  # Reduced from 1600 for faster processing
+    # Higher resolution for better accuracy
+    target_width = 1920  # Increased for better text recognition
     scale = target_width / img.width
     new_height = int(img.height * scale)
     
-    # LANCZOS is faster than BICUBIC with similar quality
-    img = img.resize((target_width, new_height), Image.LANCZOS)
+    # BICUBIC for better quality
+    img = img.resize((target_width, new_height), Image.BICUBIC)
     return img
 
 
@@ -67,10 +96,10 @@ def decode_pdf(b64):
     pdf_bytes = base64.b64decode(b64)
     images = convert_from_bytes(
         pdf_bytes,
-        dpi=120,  # Reduced from 150 for faster processing
+        dpi=200,  # Increased for better quality
         fmt="png",
-        thread_count=6,  # Increased for better CPU utilization
-        use_pdftocairo=True  # Faster rendering
+        thread_count=4,
+        use_pdftocairo=True
     )
     return images[:MAX_PAGES]
 
@@ -113,9 +142,9 @@ def load_model():
 
 
 # ===============================
-# OCR ONE PAGE (OPTIMIZED)
+# OCR ONE PAGE (ACCURACY OPTIMIZED)
 # ===============================
-@torch.inference_mode()  # Decorator for cleaner code
+@torch.inference_mode()
 def ocr_page(image: Image.Image) -> str:
     messages = [
         {
@@ -125,8 +154,18 @@ def ocr_page(image: Image.Image) -> str:
                 {
                     "type": "text",
                     "text": (
-                        "Extract all text from this document including headers, "
-                        "tables, footers, numbers, and special characters."
+                        "You are a professional OCR system. Extract ALL text from this document "
+                        "EXACTLY as written. Include:\n"
+                        "- All headers, titles, and sections\n"
+                        "- All body text and paragraphs\n"
+                        "- All tables with correct alignment\n"
+                        "- All numbers, dates, and codes EXACTLY as shown\n"
+                        "- All names, addresses, and contact information\n"
+                        "- All signatures, stamps, and annotations\n"
+                        "- Preserve original spelling and formatting\n"
+                        "- Do NOT correct typos or translate anything\n"
+                        "- Do NOT add interpretations or summaries\n"
+                        "Return ONLY the extracted text, nothing else."
                     )
                 }
             ]
@@ -143,16 +182,18 @@ def ocr_page(image: Image.Image) -> str:
         images=[image],
         return_tensors="pt",
         padding=True
-    ).to(DEVICE, non_blocking=True)  # Non-blocking transfer
+    ).to(DEVICE, non_blocking=True)
 
-    # Optimized generation parameters
+    # More conservative generation for accuracy
     output_ids = model.generate(
         **inputs,
-        max_new_tokens=1024,  # Reduced from 1200
-        temperature=0.1,
-        do_sample=False,  # Greedy decoding is faster
-        num_beams=1,  # Disable beam search for speed
-        use_cache=True,  # Enable KV cache
+        max_new_tokens=2048,  # Increased for long documents
+        min_new_tokens=10,    # Ensure some output
+        temperature=0.0,      # Deterministic for consistency
+        do_sample=False,
+        num_beams=1,
+        repetition_penalty=1.1,  # Reduce repetition
+        use_cache=True,
         pad_token_id=processor.tokenizer.pad_token_id,
         eos_token_id=processor.tokenizer.eos_token_id
     )
@@ -160,34 +201,51 @@ def ocr_page(image: Image.Image) -> str:
     decoded = processor.batch_decode(
         output_ids,
         skip_special_tokens=True,
-        clean_up_tokenization_spaces=True
+        clean_up_tokenization_spaces=False  # Keep original spacing
     )[0]
 
-    # Clean up the response
-    if "assistant" in decoded:
-        decoded = decoded.split("assistant", 1)[-1]
+    # Clean up the response more carefully
+    if "assistant" in decoded.lower():
+        parts = decoded.lower().split("assistant")
+        if len(parts) > 1:
+            decoded = decoded[decoded.lower().index("assistant") + len("assistant"):]
 
     decoded = decoded.strip()
     
-    # Remove system/user prefixes
-    for prefix in ["system\n", "user\n", "."]:
-        if decoded.startswith(prefix):
-            decoded = decoded.split("\n", 1)[-1].strip()
+    # Remove ALL system/user/assistant prefixes more aggressively
+    prefixes_to_remove = [
+        "system\n", "user\n", "assistant\n",
+        "System\n", "User\n", "Assistant\n",
+        "SYSTEM\n", "USER\n", "ASSISTANT\n"
+    ]
+    
+    for prefix in prefixes_to_remove:
+        if decoded.lower().startswith(prefix.lower()):
+            decoded = decoded[len(prefix):].strip()
+    
+    # Remove the extraction instruction if it appears
+    instruction = "extract all text from this document including headers, tables, footers, numbers, and special characters."
+    if decoded.lower().startswith(instruction):
+        decoded = decoded[len(instruction):].strip()
+    
+    # Remove leading dots/colons only if they're artifacts
+    if decoded.startswith((".\n", ":\n", ". ", ": ")):
+        decoded = decoded.lstrip(".:").strip()
 
     return decoded
 
 
 # ===============================
-# BATCH PROCESSING (NEW)
+# BATCH PROCESSING (ACCURACY OPTIMIZED)
 # ===============================
 @torch.inference_mode()
 def ocr_batch(images: list[Image.Image]) -> list[str]:
-    """Process multiple pages in a single batch for better GPU utilization"""
+    """Process multiple pages - with accuracy priority"""
     if len(images) == 1:
         return [ocr_page(images[0])]
     
-    # For small batches, process together
-    batch_size = min(4, len(images))  # RTX 4090 can handle 4 pages
+    # Smaller batches for better accuracy
+    batch_size = min(2, len(images))  # Reduced to 2 for better quality
     results = []
     
     for i in range(0, len(images), batch_size):
@@ -202,7 +260,20 @@ def ocr_batch(images: list[Image.Image]) -> list[str]:
                         {"type": "image"},
                         {
                             "type": "text",
-                            "text": "Extract all text from this document including headers, tables, footers, numbers, and special characters."
+                            "text": (
+                                "You are a professional OCR system. Extract ALL text from this document "
+                                "EXACTLY as written. Include:\n"
+                                "- All headers, titles, and sections\n"
+                                "- All body text and paragraphs\n"
+                                "- All tables with correct alignment\n"
+                                "- All numbers, dates, and codes EXACTLY as shown\n"
+                                "- All names, addresses, and contact information\n"
+                                "- All signatures, stamps, and annotations\n"
+                                "- Preserve original spelling and formatting\n"
+                                "- Do NOT correct typos or translate anything\n"
+                                "- Do NOT add interpretations or summaries\n"
+                                "Return ONLY the extracted text, nothing else."
+                            )
                         }
                     ]
                 }
@@ -219,10 +290,12 @@ def ocr_batch(images: list[Image.Image]) -> list[str]:
         
         output_ids = model.generate(
             **inputs,
-            max_new_tokens=1024,
-            temperature=0.1,
+            max_new_tokens=2048,
+            min_new_tokens=10,
+            temperature=0.0,
             do_sample=False,
             num_beams=1,
+            repetition_penalty=1.1,
             use_cache=True,
             pad_token_id=processor.tokenizer.pad_token_id,
             eos_token_id=processor.tokenizer.eos_token_id
@@ -231,16 +304,37 @@ def ocr_batch(images: list[Image.Image]) -> list[str]:
         decoded_batch = processor.batch_decode(
             output_ids,
             skip_special_tokens=True,
-            clean_up_tokenization_spaces=True
+            clean_up_tokenization_spaces=False
         )
         
         for decoded in decoded_batch:
-            if "assistant" in decoded:
-                decoded = decoded.split("assistant", 1)[-1]
+            if "assistant" in decoded.lower():
+                parts = decoded.lower().split("assistant")
+                if len(parts) > 1:
+                    decoded = decoded[decoded.lower().index("assistant") + len("assistant"):]
+            
             decoded = decoded.strip()
-            for prefix in ["system\n", "user\n", "."]:
-                if decoded.startswith(prefix):
-                    decoded = decoded.split("\n", 1)[-1].strip()
+            
+            # Remove ALL system/user/assistant prefixes more aggressively
+            prefixes_to_remove = [
+                "system\n", "user\n", "assistant\n",
+                "System\n", "User\n", "Assistant\n",
+                "SYSTEM\n", "USER\n", "ASSISTANT\n"
+            ]
+            
+            for prefix in prefixes_to_remove:
+                if decoded.lower().startswith(prefix.lower()):
+                    decoded = decoded[len(prefix):].strip()
+            
+            # Remove the extraction instruction if it appears
+            instruction = "extract all text from this document including headers, tables, footers, numbers, and special characters."
+            if decoded.lower().startswith(instruction):
+                decoded = decoded[len(instruction):].strip()
+            
+            # Remove leading dots/colons only if they're artifacts
+            if decoded.startswith((".\n", ":\n", ". ", ": ")):
+                decoded = decoded.lstrip(".:").strip()
+            
             results.append(decoded)
     
     return results
@@ -252,11 +346,18 @@ def ocr_batch(images: list[Image.Image]) -> list[str]:
 def handler(event):
     load_model()
 
-    PREFIX = (
-        "Return the COMPLETE plain text of this document from top to bottom, "
-        "including headers, tables, footers, bank details, signatures, stamps, "
-        "emails, phone numbers, and all numbers exactly as written.\nassistant\n"
-    )
+    # Prefixes that might appear in output and should be removed
+    PREFIXES_TO_REMOVE = [
+        "user\nExtract all text from this document including headers, tables, footers, numbers, and special characters.\nassistant\n",
+        "user\n",
+        "assistant\n",
+        "system\n",
+        "User\n",
+        "Assistant\n",
+        "System\n",
+        "Extract all text from this document including headers, tables, footers, numbers, and special characters.\n",
+        "Return the COMPLETE plain text of this document from top to bottom, including headers, tables, footers, bank details, signatures, stamps, emails, phone numbers, and all numbers exactly as written.\nassistant\n"
+    ]
 
     try:
         if "image" in event["input"]:
@@ -272,13 +373,39 @@ def handler(event):
         # Use batch processing for better performance
         if len(pages) > 1:
             texts = ocr_batch(pages)
-            extracted_pages = [
-                {"page": i, "text": text.replace(PREFIX, "", 1)}
-                for i, text in enumerate(texts, start=1)
-            ]
+            extracted_pages = []
+            for i, text in enumerate(texts, start=1):
+                # Remove all known prefixes
+                for prefix in PREFIXES_TO_REMOVE:
+                    if text.startswith(prefix):
+                        text = text[len(prefix):]
+                        break  # Only remove first match
+                
+                text = text.strip()
+                
+                # Skip hallucinated/garbage pages
+                if is_hallucinated_output(text):
+                    log(f"Warning: Page {i} appears to be hallucinated, marking as empty")
+                    text = "[Empty or unreadable page]"
+                
+                extracted_pages.append({"page": i, "text": text})
         else:
             text = ocr_page(pages[0])
-            extracted_pages = [{"page": 1, "text": text.replace(PREFIX, "", 1)}]
+            
+            # Remove all known prefixes
+            for prefix in PREFIXES_TO_REMOVE:
+                if text.startswith(prefix):
+                    text = text[len(prefix):]
+                    break
+            
+            text = text.strip()
+            
+            # Check for hallucination
+            if is_hallucinated_output(text):
+                log("Warning: Page appears to be hallucinated, marking as empty")
+                text = "[Empty or unreadable page]"
+            
+            extracted_pages = [{"page": 1, "text": text}]
 
         # Clear cache after processing
         if torch.cuda.is_available():
@@ -307,7 +434,7 @@ load_model()
 # Warmup run for optimal performance
 if torch.cuda.is_available():
     log("Running warmup...")
-    dummy_image = Image.new('RGB', (1280, 1600), color='white')
+    dummy_image = Image.new('RGB', (1920, 1600), color='white')  # Match resolution
     try:
         _ = ocr_page(dummy_image)
         torch.cuda.empty_cache()
