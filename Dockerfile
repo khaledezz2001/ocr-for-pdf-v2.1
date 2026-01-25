@@ -39,8 +39,8 @@ RUN apt-get update && apt-get install -y \
 # Python symlink
 RUN ln -s /usr/bin/python3 /usr/bin/python
 
-# Upgrade pip and install build tools
-RUN pip install --upgrade pip setuptools wheel ninja
+# Upgrade pip
+RUN pip install --upgrade pip setuptools wheel
 
 # -------------------------------
 # PYTHON DEPENDENCIES
@@ -49,15 +49,16 @@ COPY requirements.txt .
 
 # Install PyTorch with CUDA 12.6 support
 RUN pip install --no-cache-dir \
-    torch==2.5.1 \
-    torchvision==0.20.1 \
+    torch==2.8.0 \
+    torchvision==0.23.0 \
     --index-url https://download.pytorch.org/whl/cu126
 
 # Install other dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Flash Attention 2 (compiled for RTX 5090)
-RUN pip install --no-cache-dir flash-attn --no-build-isolation
+# Try to install Flash Attention (optional - won't fail build if it doesn't work)
+RUN pip install --no-cache-dir flash-attn --no-build-isolation || \
+    echo "Flash Attention installation failed - continuing without it"
 
 # -------------------------------
 # MODEL DOWNLOAD (BUILD TIME)
