@@ -89,13 +89,25 @@ def load_model():
     )
 
     log("Loading model on RTX 5090...")
-    model = AutoModelForImageTextToText.from_pretrained(
-        MODEL_PATH,
-        device_map="auto",
-        torch_dtype=torch.bfloat16,  # BF16 for 5090 (better than FP16)
-        local_files_only=True,
-        attn_implementation="flash_attention_2"  # If model supports it
-    )
+    
+    # Try Flash Attention 2, fall back to default if not available
+    try:
+        model = AutoModelForImageTextToText.from_pretrained(
+            MODEL_PATH,
+            device_map="auto",
+            torch_dtype=torch.bfloat16,  # BF16 for 5090 (better than FP16)
+            local_files_only=True,
+            attn_implementation="flash_attention_2"
+        )
+        log("✓ Using Flash Attention 2")
+    except Exception as e:
+        log(f"Flash Attention not available, using default: {e}")
+        model = AutoModelForImageTextToText.from_pretrained(
+            MODEL_PATH,
+            device_map="auto",
+            torch_dtype=torch.bfloat16,
+            local_files_only=True
+        )
 
     model.eval()
     
