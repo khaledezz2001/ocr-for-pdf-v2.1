@@ -203,18 +203,9 @@ def handler(event):
     load_model()
 
     # All known prefixes that need to be removed
-    PREFIXES_TO_REMOVE = [
-        "user\nYou are a professional OCR system. Extract ALL text from this document EXACTLY as written. Include:\n- All headers, titles, and sections\n- All body text and paragraphs\n- All tables with correct alignment\n- All numbers, dates, and codes EXACTLY as shown\n- All names, addresses, and contact information\n- All signatures, stamps, and annotations\n- Preserve original spelling and formatting\n- Do NOT correct typos or translate anything\n- Do NOT add interpretations or summaries\nReturn ONLY the extracted text, nothing else.\nassistant\n",
-        "user\nExtract all text from this document including headers, tables, footers, numbers, and special characters.\nassistant\n",
-        "user\n",
-        "assistant\n",
-        "system\n",
-        "User\n",
-        "Assistant\n",
-        "System\n",
-        "You are a professional OCR system. Extract ALL text from this document EXACTLY as written.",
-        "Extract all text from this document including headers, tables, footers, numbers, and special characters.",
-    ]
+    PREFIXES_TO_REMOVE = (
+        ".\nuser\nYou are a professional OCR system. Extract ALL text from this document EXACTLY as written. Include:\n- All headers, titles, and sections\n- All body text and paragraphs\n- All tables with correct alignment\n- All numbers, dates, and codes EXACTLY as shown\n- All names, addresses, and contact information\n- All signatures, stamps, and annotations\n- Preserve original spelling and formatting\n- Do NOT correct typos or translate anything\n- Do NOT add interpretations or summaries\nReturn ONLY the extracted text, nothing else.\nassistant\n"
+    )
 
     try:
         if "image" in event["input"]:
@@ -233,12 +224,9 @@ def handler(event):
             text = ocr_page(page)
             
             # Remove all known prefixes
-            for prefix in PREFIXES_TO_REMOVE:
-                if text.startswith(prefix):
-                    text = text[len(prefix):]
-                    break
             
-            text = text.strip()
+            
+            
             
             # Detect hallucinations
             if is_hallucinated_output(text):
@@ -247,7 +235,7 @@ def handler(event):
             
             extracted_pages.append({
                 "page": i,
-                "text": text
+                "text": text.replace(PREFIX, "", 1)
             })
 
         # Clear GPU cache
