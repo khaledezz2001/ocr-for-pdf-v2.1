@@ -33,14 +33,10 @@ model = None
 # RTX 4090 OPTIMIZATIONS
 # ===============================
 if torch.cuda.is_available():
-    # Enable TF32 for faster computation on Ampere+ GPUs
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True  # Auto-tune kernels
-    
-    # Set memory allocation strategy
+    torch.backends.cudnn.benchmark = True
     torch.cuda.empty_cache()
-    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512'
 
 
 def log(msg):
@@ -58,7 +54,6 @@ def is_hallucinated_output(text: str) -> bool:
     # Check for repetitive table patterns (like page 13)
     lines = text.strip().split('\n')
     if len(lines) > 20:
-        # Check if most lines are identical or very similar
         unique_lines = set(line.strip() for line in lines if line.strip())
         if len(unique_lines) < 3:  # Too repetitive
             return True
@@ -81,14 +76,14 @@ def is_hallucinated_output(text: str) -> bool:
 # ===============================
 def decode_image(b64):
     img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
-    
+
     # Higher resolution for better accuracy
-    target_width = 1920  # Increased for better text recognition
+    target_width = 1920
     scale = target_width / img.width
-    new_height = int(img.height * scale)
-    
-    # BICUBIC for better quality
-    img = img.resize((target_width, new_height), Image.BICUBIC)
+    img = img.resize(
+        (target_width, int(img.height * scale)),
+        Image.BICUBIC
+    )
     return img
 
 
@@ -122,29 +117,18 @@ def load_model():
     model = AutoModelForImageTextToText.from_pretrained(
         MODEL_PATH,
         device_map="auto",
-        torch_dtype=torch.float16,  # Always use FP16 on GPU
+        torch_dtype=torch.float16,
         local_files_only=True,
-        low_cpu_mem_usage=True  # Faster loading
+        low_cpu_mem_usage=True
     )
 
     model.eval()
-    
-    # Compile model for faster inference (PyTorch 2.0+)
-    if hasattr(torch, 'compile') and DEVICE == "cuda":
-        log("Compiling model with torch.compile...")
-        try:
-            model = torch.compile(model, mode="reduce-overhead")
-            log("Model compiled successfully")
-        except Exception as e:
-            log(f"Compilation failed: {e}, using eager mode")
-    
-    log("RolmOCR model loaded and ready")
+    log("RolmOCR model loaded")
 
 
 # ===============================
 # OCR ONE PAGE (ACCURACY OPTIMIZED)
 # ===============================
-@torch.inference_mode()
 def ocr_page(image: Image.Image) -> str:
     messages = [
         {
@@ -184,160 +168,32 @@ def ocr_page(image: Image.Image) -> str:
         padding=True
     ).to(DEVICE, non_blocking=True)
 
-    # More conservative generation for accuracy
-    output_ids = model.generate(
-        **inputs,
-        max_new_tokens=2048,  # Increased for long documents
-        min_new_tokens=10,    # Ensure some output
-        temperature=0.0,      # Deterministic for consistency
-        do_sample=False,
-        num_beams=1,
-        repetition_penalty=1.1,  # Reduce repetition
-        use_cache=True,
-        pad_token_id=processor.tokenizer.pad_token_id,
-        eos_token_id=processor.tokenizer.eos_token_id
-    )
-
-    decoded = processor.batch_decode(
-        output_ids,
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False  # Keep original spacing
-    )[0]
-
-    # Clean up the response more carefully
-    if "assistant" in decoded.lower():
-        parts = decoded.lower().split("assistant")
-        if len(parts) > 1:
-            decoded = decoded[decoded.lower().index("assistant") + len("assistant"):]
-
-    decoded = decoded.strip()
-    
-    # Remove ALL system/user/assistant prefixes more aggressively
-    prefixes_to_remove = [
-        "system\n", "user\n", "assistant\n",
-        "System\n", "User\n", "Assistant\n",
-        "SYSTEM\n", "USER\n", "ASSISTANT\n"
-    ]
-    
-    for prefix in prefixes_to_remove:
-        if decoded.lower().startswith(prefix.lower()):
-            decoded = decoded[len(prefix):].strip()
-    
-    # Remove the extraction instruction if it appears
-    instruction = "extract all text from this document including headers, tables, footers, numbers, and special characters."
-    if decoded.lower().startswith(instruction):
-        decoded = decoded[len(instruction):].strip()
-    
-    # Remove leading dots/colons only if they're artifacts
-    if decoded.startswith((".\n", ":\n", ". ", ": ")):
-        decoded = decoded.lstrip(".:").strip()
-
-    return decoded
-
-
-# ===============================
-# BATCH PROCESSING (ACCURACY OPTIMIZED)
-# ===============================
-@torch.inference_mode()
-def ocr_batch(images: list[Image.Image]) -> list[str]:
-    """Process multiple pages - with accuracy priority"""
-    if len(images) == 1:
-        return [ocr_page(images[0])]
-    
-    # Smaller batches for better accuracy
-    batch_size = min(2, len(images))  # Reduced to 2 for better quality
-    results = []
-    
-    for i in range(0, len(images), batch_size):
-        batch = images[i:i+batch_size]
-        
-        messages_list = []
-        for _ in batch:
-            messages_list.append([
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image"},
-                        {
-                            "type": "text",
-                            "text": (
-                                "You are a professional OCR system. Extract ALL text from this document "
-                                "EXACTLY as written. Include:\n"
-                                "- All headers, titles, and sections\n"
-                                "- All body text and paragraphs\n"
-                                "- All tables with correct alignment\n"
-                                "- All numbers, dates, and codes EXACTLY as shown\n"
-                                "- All names, addresses, and contact information\n"
-                                "- All signatures, stamps, and annotations\n"
-                                "- Preserve original spelling and formatting\n"
-                                "- Do NOT correct typos or translate anything\n"
-                                "- Do NOT add interpretations or summaries\n"
-                                "Return ONLY the extracted text, nothing else."
-                            )
-                        }
-                    ]
-                }
-            ])
-        
-        prompts = [processor.apply_chat_template(m, add_generation_prompt=True) for m in messages_list]
-        
-        inputs = processor(
-            text=prompts,
-            images=batch,
-            return_tensors="pt",
-            padding=True
-        ).to(DEVICE, non_blocking=True)
-        
+    with torch.inference_mode():
         output_ids = model.generate(
             **inputs,
-            max_new_tokens=2048,
+            max_new_tokens=2048,      # Increased for long documents
             min_new_tokens=10,
-            temperature=0.0,
+            temperature=0.0,          # Deterministic (no hallucination)
             do_sample=False,
             num_beams=1,
-            repetition_penalty=1.1,
+            repetition_penalty=1.1,   # Reduce repetition
             use_cache=True,
             pad_token_id=processor.tokenizer.pad_token_id,
             eos_token_id=processor.tokenizer.eos_token_id
         )
-        
-        decoded_batch = processor.batch_decode(
-            output_ids,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False
-        )
-        
-        for decoded in decoded_batch:
-            if "assistant" in decoded.lower():
-                parts = decoded.lower().split("assistant")
-                if len(parts) > 1:
-                    decoded = decoded[decoded.lower().index("assistant") + len("assistant"):]
-            
-            decoded = decoded.strip()
-            
-            # Remove ALL system/user/assistant prefixes more aggressively
-            prefixes_to_remove = [
-                "system\n", "user\n", "assistant\n",
-                "System\n", "User\n", "Assistant\n",
-                "SYSTEM\n", "USER\n", "ASSISTANT\n"
-            ]
-            
-            for prefix in prefixes_to_remove:
-                if decoded.lower().startswith(prefix.lower()):
-                    decoded = decoded[len(prefix):].strip()
-            
-            # Remove the extraction instruction if it appears
-            instruction = "extract all text from this document including headers, tables, footers, numbers, and special characters."
-            if decoded.lower().startswith(instruction):
-                decoded = decoded[len(instruction):].strip()
-            
-            # Remove leading dots/colons only if they're artifacts
-            if decoded.startswith((".\n", ":\n", ". ", ": ")):
-                decoded = decoded.lstrip(".:").strip()
-            
-            results.append(decoded)
-    
-    return results
+
+    decoded = processor.batch_decode(
+        output_ids,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False
+    )[0]
+
+    # Clean up response
+    if "assistant" in decoded.lower():
+        idx = decoded.lower().index("assistant") + len("assistant")
+        decoded = decoded[idx:]
+
+    return decoded.strip()
 
 
 # ===============================
@@ -346,8 +202,9 @@ def ocr_batch(images: list[Image.Image]) -> list[str]:
 def handler(event):
     load_model()
 
-    # Prefixes that might appear in output and should be removed
+    # All known prefixes that need to be removed
     PREFIXES_TO_REMOVE = [
+        "user\nYou are a professional OCR system. Extract ALL text from this document EXACTLY as written. Include:\n- All headers, titles, and sections\n- All body text and paragraphs\n- All tables with correct alignment\n- All numbers, dates, and codes EXACTLY as shown\n- All names, addresses, and contact information\n- All signatures, stamps, and annotations\n- Preserve original spelling and formatting\n- Do NOT correct typos or translate anything\n- Do NOT add interpretations or summaries\nReturn ONLY the extracted text, nothing else.\nassistant\n",
         "user\nExtract all text from this document including headers, tables, footers, numbers, and special characters.\nassistant\n",
         "user\n",
         "assistant\n",
@@ -355,8 +212,8 @@ def handler(event):
         "User\n",
         "Assistant\n",
         "System\n",
-        "Extract all text from this document including headers, tables, footers, numbers, and special characters.\n",
-        "Return the COMPLETE plain text of this document from top to bottom, including headers, tables, footers, bank details, signatures, stamps, emails, phone numbers, and all numbers exactly as written.\nassistant\n"
+        "You are a professional OCR system. Extract ALL text from this document EXACTLY as written.",
+        "Extract all text from this document including headers, tables, footers, numbers, and special characters.",
     ]
 
     try:
@@ -370,27 +227,10 @@ def handler(event):
                 "message": "Missing image or file"
             }
 
-        # Use batch processing for better performance
-        if len(pages) > 1:
-            texts = ocr_batch(pages)
-            extracted_pages = []
-            for i, text in enumerate(texts, start=1):
-                # Remove all known prefixes
-                for prefix in PREFIXES_TO_REMOVE:
-                    if text.startswith(prefix):
-                        text = text[len(prefix):]
-                        break  # Only remove first match
-                
-                text = text.strip()
-                
-                # Skip hallucinated/garbage pages
-                if is_hallucinated_output(text):
-                    log(f"Warning: Page {i} appears to be hallucinated, marking as empty")
-                    text = "[Empty or unreadable page]"
-                
-                extracted_pages.append({"page": i, "text": text})
-        else:
-            text = ocr_page(pages[0])
+        extracted_pages = []
+
+        for i, page in enumerate(pages, start=1):
+            text = ocr_page(page)
             
             # Remove all known prefixes
             for prefix in PREFIXES_TO_REMOVE:
@@ -400,14 +240,17 @@ def handler(event):
             
             text = text.strip()
             
-            # Check for hallucination
+            # Detect hallucinations
             if is_hallucinated_output(text):
-                log("Warning: Page appears to be hallucinated, marking as empty")
+                log(f"Warning: Page {i} appears to be hallucinated")
                 text = "[Empty or unreadable page]"
             
-            extracted_pages = [{"page": 1, "text": text}]
+            extracted_pages.append({
+                "page": i,
+                "text": text
+            })
 
-        # Clear cache after processing
+        # Clear GPU cache
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -416,9 +259,11 @@ def handler(event):
             "total_pages": len(extracted_pages),
             "pages": extracted_pages
         }
-    
+
     except Exception as e:
         log(f"Error: {str(e)}")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return {
             "status": "error",
             "message": str(e)
@@ -431,10 +276,10 @@ def handler(event):
 log("Preloading model...")
 load_model()
 
-# Warmup run for optimal performance
+# Warmup for optimal performance
 if torch.cuda.is_available():
     log("Running warmup...")
-    dummy_image = Image.new('RGB', (1920, 1600), color='white')  # Match resolution
+    dummy_image = Image.new('RGB', (1920, 1600), color='white')
     try:
         _ = ocr_page(dummy_image)
         torch.cuda.empty_cache()
