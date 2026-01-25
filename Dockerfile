@@ -1,10 +1,10 @@
-FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+FROM nvidia/cuda:12.6.0-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
 
 # -------------------------------
-# HF CACHE PATH S
+# HF CACHE PATHS
 # -------------------------------
 ENV HF_HOME=/models/hf
 ENV TRANSFORMERS_CACHE=/models/hf
@@ -14,33 +14,50 @@ ENV HF_HUB_DISABLE_XET=1
 ENV TOKENIZERS_PARALLELISM=false
 
 # -------------------------------
+# RTX 5090 CUDA OPTIMIZATIONS
+# -------------------------------
+ENV PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+ENV CUDA_MODULE_LOADING=LAZY
+
+# -------------------------------
 # SYSTEM DEPENDENCIES
 # -------------------------------
 RUN apt-get update && apt-get install -y \
     python3.10 \
     python3-pip \
+    python3-dev \
+    build-essential \
     poppler-utils \
     libgl1 \
     libglib2.0-0 \
     libgomp1 \
     ca-certificates \
     git \
+    wget \
     && rm -rf /var/lib/apt/lists/*
 
 # Python symlink
 RUN ln -s /usr/bin/python3 /usr/bin/python
 
-# Upgrade pip
-RUN pip install --upgrade pip
+# Upgrade pip and install build tools
+RUN pip install --upgrade pip setuptools wheel ninja
 
 # -------------------------------
 # PYTHON DEPENDENCIES
 # -------------------------------
 COPY requirements.txt .
 
+# Install PyTorch with CUDA 12.6 support
 RUN pip install --no-cache-dir \
-    --extra-index-url https://download.pytorch.org/whl/cu124 \
-    -r requirements.txt
+    torch==2.5.1 \
+    torchvision==0.20.1 \
+    --index-url https://download.pytorch.org/whl/cu126
+
+# Install other dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install Flash Attention 2 (compiled for RTX 5090)
+RUN pip install --no-cache-dir flash-attn --no-build-isolation
 
 # -------------------------------
 # MODEL DOWNLOAD (BUILD TIME)
@@ -54,7 +71,7 @@ snapshot_download(
     local_dir_use_symlinks=False
 )
 
-print("RolmOCR downloaded")
+print("✓ RolmOCR model downloaded successfully")
 EOF
 
 # -------------------------------
@@ -67,5 +84,9 @@ ENV TRANSFORMERS_OFFLINE=1
 # APP
 # -------------------------------
 COPY handler.py .
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD python -c "import torch; assert torch.cuda.is_available()" || exit 1
 
 CMD ["python", "-u", "handler.py"]
