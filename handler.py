@@ -19,21 +19,34 @@ os.environ["HF_HUB_DISABLE_XET"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # ===============================
+# RTX 5090 OPTIMIZATIONS
+# ===============================
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+
+# ===============================
 # CONFIG
 # ===============================
 MODEL_PATH = "/models/hf/reducto/RolmOCR"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda"
 
 processor = None
 model = None
 
 # ===============================
-# RTX SPEED / STABILITY
+# RTX 5090 PERFORMANCE SETTINGS
 # ===============================
 if torch.cuda.is_available():
+    # TF32 for massive speedup on 5090
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True  # Added for speed
+    torch.backends.cudnn.benchmark = True
+    
+    # Use Flash Attention 2 if available
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    
+    # Set CUDA device properties for optimal performance
+    torch.cuda.set_per_process_memory_fraction(0.95, 0)
 
 
 def log(msg):
@@ -41,27 +54,28 @@ def log(msg):
 
 
 # ===============================
-# IMAGE DECODING (OPTIMIZED)
+# IMAGE DECODING (5090 OPTIMIZED)
 # ===============================
 def decode_image(b64):
     img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
     
-    # Reduced from 1600 to 1280 for faster processing
-    # Adjust based on your document quality needs
-    target_width = 1280
+    # RTX 5090 can handle larger images easily
+    # Increased to 2048 for better OCR accuracy
+    target_width = 2048
     
-    # Only resize if image is larger
     if img.width > target_width:
         scale = target_width / img.width
+        new_height = int(img.height * scale)
         img = img.resize(
-            (target_width, int(img.height * scale)),
-            Image.LANCZOS  # Changed from BICUBIC for better quality/speed balance
+            (target_width, new_height),
+            Image.LANCZOS
         )
+    
     return img
 
 
 # ===============================
-# LOAD MODEL ONCE
+# LOAD MODEL (5090 OPTIMIZED)
 # ===============================
 def load_model():
     global processor, model
@@ -74,42 +88,58 @@ def load_model():
         local_files_only=True
     )
 
-    log("Loading model...")
+    log("Loading model on RTX 5090...")
     model = AutoModelForImageTextToText.from_pretrained(
         MODEL_PATH,
         device_map="auto",
-        torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
-        local_files_only=True
+        torch_dtype=torch.bfloat16,  # BF16 for 5090 (better than FP16)
+        local_files_only=True,
+        attn_implementation="flash_attention_2"  # If model supports it
     )
 
     model.eval()
     
-    # Warm up the model with a dummy inference
-    if DEVICE == "cuda":
-        log("Warming up model...")
-        dummy_img = Image.new('RGB', (1280, 720), color='white')
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "image"},
-                {"type": "text", "text": "test"}
-            ]
-        }]
-        prompt = processor.apply_chat_template(messages, add_generation_prompt=True)
-        inputs = processor(text=[prompt], images=[dummy_img], return_tensors="pt").to(DEVICE)
-        
-        with torch.inference_mode():
-            _ = model.generate(**inputs, max_new_tokens=10)
-        
-        torch.cuda.empty_cache()
+    # Compile model for extra speed (PyTorch 2.0+)
+    if hasattr(torch, 'compile'):
+        log("Compiling model with torch.compile()...")
+        model = torch.compile(model, mode="reduce-overhead")
     
-    log("RolmOCR model loaded and ready")
+    # Warm up with realistic inference
+    log("Warming up RTX 5090...")
+    dummy_img = Image.new('RGB', (2048, 1440), color='white')
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "image"},
+            {"type": "text", "text": "Extract all text"}
+        ]
+    }]
+    
+    prompt = processor.apply_chat_template(messages, add_generation_prompt=True)
+    inputs = processor(text=[prompt], images=[dummy_img], return_tensors="pt").to(DEVICE)
+    
+    with torch.inference_mode():
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            _ = model.generate(**inputs, max_new_tokens=50)
+    
+    # Clear cache after warmup
+    torch.cuda.empty_cache()
+    
+    # Print GPU stats
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(0)
+        log(f"GPU: {props.name}")
+        log(f"VRAM: {props.total_memory / 1024**3:.1f} GB")
+        log(f"Memory allocated: {torch.cuda.memory_allocated() / 1024**3:.1f} GB")
+    
+    log("RTX 5090 ready - optimized for speed")
 
 
 # ===============================
-# OCR IMAGE (OPTIMIZED)
+# OCR IMAGE (5090 OPTIMIZED)
 # ===============================
-def ocr_image(image: Image.Image, max_tokens: int = 1200) -> str:
+@torch.inference_mode()
+def ocr_image(image: Image.Image, max_tokens: int = 1500) -> str:
     messages = [
         {
             "role": "user",
@@ -138,13 +168,16 @@ def ocr_image(image: Image.Image, max_tokens: int = 1200) -> str:
         return_tensors="pt"
     ).to(DEVICE)
 
-    with torch.inference_mode():
+    # Use automatic mixed precision for speed
+    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
         output_ids = model.generate(
             **inputs,
             max_new_tokens=max_tokens,
-            temperature=0.1,
-            do_sample=False,  # Greedy decoding for speed
-            num_beams=1  # Explicit single beam
+            temperature=0.0,  # Greedy for consistency
+            do_sample=False,
+            num_beams=1,
+            pad_token_id=processor.tokenizer.pad_token_id,
+            eos_token_id=processor.tokenizer.eos_token_id,
         )
 
     decoded = processor.batch_decode(
@@ -166,7 +199,7 @@ def ocr_image(image: Image.Image, max_tokens: int = 1200) -> str:
 
 
 # ===============================
-# HANDLER (OPTIMIZED)
+# HANDLER (5090 OPTIMIZED)
 # ===============================
 def handler(event):
     try:
@@ -177,22 +210,29 @@ def handler(event):
         if "image" not in input_data:
             return {
                 "status": "error",
-                "message": "Only image input is supported"
+                "message": "Missing 'image' field in input"
             }
 
-        # Optional: allow custom max_tokens
-        max_tokens = input_data.get("max_tokens", 1200)
+        # Optional parameters
+        max_tokens = input_data.get("max_tokens", 1500)
         
+        # Decode and process
         image = decode_image(input_data["image"])
         text = ocr_image(image, max_tokens=max_tokens)
 
+        # Optional: return GPU stats for monitoring
+        gpu_memory = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0
+
         return {
             "status": "success",
-            "text": text
+            "text": text,
+            "gpu_memory_gb": round(gpu_memory, 2)
         }
     
     except Exception as e:
         log(f"Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return {
             "status": "error",
             "message": str(e)
@@ -200,13 +240,14 @@ def handler(event):
 
 
 # ===============================
-# PRELOAD MODEL AT STARTUP
+# PRELOAD
 # ===============================
-log("Preloading model at startup...")
+log("="*50)
+log("RTX 5090 OCR HANDLER")
+log("="*50)
 load_model()
-log("Handler ready to accept requests")
+log("Handler ready for lightning-fast inference!")
 
-# Start RunPod serverless
 runpod.serverless.start({
     "handler": handler
 })
