@@ -1,0 +1,8 @@
+torch==2.8.0
+transformers
+accelerate
+pillow
+huggingface_hub
+protobuf
+numpy<2.0
+runpod
