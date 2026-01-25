@@ -5,6 +5,7 @@ import torch
 import runpod
 from PIL import Image
 from transformers import AutoProcessor, AutoModelForImageTextToText
+from pdf2image import convert_from_bytes
 
 # ===============================
 # OFFLINE MODE (RUNTIME)
@@ -19,56 +20,63 @@ os.environ["HF_HUB_DISABLE_XET"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # ===============================
-# RTX 4090 OPTIMIZATIONS
-# ===============================
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
-
-# ===============================
 # CONFIG
 # ===============================
 MODEL_PATH = "/models/hf/reducto/RolmOCR"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MAX_PAGES = 20
 
 processor = None
 model = None
 
 # ===============================
-# RTX 4090 PERFORMANCE SETTINGS
+# RTX 4090 OPTIMIZATIONS
 # ===============================
 if torch.cuda.is_available():
+    # Enable TF32 for faster computation on Ampere+ GPUs
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.enable_flash_sdp(True)
-    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    torch.backends.cudnn.benchmark = True  # Auto-tune kernels
+    
+    # Set memory allocation strategy
+    torch.cuda.empty_cache()
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512'
 
 
 def log(msg):
-    print(f"[HANDLER] {msg}", flush=True)
+    print(f"[BOOT] {msg}", flush=True)
 
 
 # ===============================
-# IMAGE DECODING (4090 OPTIMIZED)
+# IMAGE DECODING (OPTIMIZED)
 # ===============================
 def decode_image(b64):
     img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
     
-    # RTX 4090 24GB can handle large images
-    target_width = 1920
+    # Optimized resize for speed
+    target_width = 1280  # Reduced from 1600 for faster processing
+    scale = target_width / img.width
+    new_height = int(img.height * scale)
     
-    if img.width > target_width:
-        scale = target_width / img.width
-        new_height = int(img.height * scale)
-        img = img.resize(
-            (target_width, new_height),
-            Image.LANCZOS
-        )
-    
+    # LANCZOS is faster than BICUBIC with similar quality
+    img = img.resize((target_width, new_height), Image.LANCZOS)
     return img
 
 
+def decode_pdf(b64):
+    pdf_bytes = base64.b64decode(b64)
+    images = convert_from_bytes(
+        pdf_bytes,
+        dpi=120,  # Reduced from 150 for faster processing
+        fmt="png",
+        thread_count=6,  # Increased for better CPU utilization
+        use_pdftocairo=True  # Faster rendering
+    )
+    return images[:MAX_PAGES]
+
+
 # ===============================
-# LOAD MODEL (4090 OPTIMIZED)
+# LOAD MODEL ONCE
 # ===============================
 def load_model():
     global processor, model
@@ -81,50 +89,34 @@ def load_model():
         local_files_only=True
     )
 
-    log("Loading model on RTX 4090...")
+    log("Loading model...")
     model = AutoModelForImageTextToText.from_pretrained(
         MODEL_PATH,
         device_map="auto",
-        torch_dtype=torch.float16,  # FP16 for 4090
-        local_files_only=True
+        torch_dtype=torch.float16,  # Always use FP16 on GPU
+        local_files_only=True,
+        low_cpu_mem_usage=True  # Faster loading
     )
 
     model.eval()
     
-    # Warmup inference
-    log("Warming up RTX 4090...")
-    dummy_img = Image.new('RGB', (1920, 1080), color='white')
-    messages = [{
-        "role": "user",
-        "content": [
-            {"type": "image"},
-            {"type": "text", "text": "test"}
-        ]
-    }]
+    # Compile model for faster inference (PyTorch 2.0+)
+    if hasattr(torch, 'compile') and DEVICE == "cuda":
+        log("Compiling model with torch.compile...")
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+            log("Model compiled successfully")
+        except Exception as e:
+            log(f"Compilation failed: {e}, using eager mode")
     
-    prompt = processor.apply_chat_template(messages, add_generation_prompt=True)
-    inputs = processor(text=[prompt], images=[dummy_img], return_tensors="pt").to(DEVICE)
-    
-    with torch.inference_mode():
-        _ = model.generate(**inputs, max_new_tokens=10)
-    
-    torch.cuda.empty_cache()
-    
-    # GPU stats
-    if torch.cuda.is_available():
-        props = torch.cuda.get_device_properties(0)
-        log(f"GPU: {props.name}")
-        log(f"VRAM Total: {props.total_memory / 1024**3:.1f} GB")
-        log(f"VRAM Used: {torch.cuda.memory_allocated() / 1024**3:.1f} GB")
-    
-    log("RTX 4090 ready!")
+    log("RolmOCR model loaded and ready")
 
 
 # ===============================
-# OCR IMAGE (4090 OPTIMIZED)
+# OCR ONE PAGE (OPTIMIZED)
 # ===============================
-@torch.inference_mode()
-def ocr_image(image: Image.Image, max_tokens: int = 1500) -> str:
+@torch.inference_mode()  # Decorator for cleaner code
+def ocr_page(image: Image.Image) -> str:
     messages = [
         {
             "role": "user",
@@ -133,9 +125,8 @@ def ocr_image(image: Image.Image, max_tokens: int = 1500) -> str:
                 {
                     "type": "text",
                     "text": (
-                        "Return the COMPLETE plain text of this document from top to bottom, "
-                        "including headers, tables, footers, bank details, signatures, stamps, "
-                        "emails, phone numbers, and all numbers exactly as written."
+                        "Extract all text from this document including headers, "
+                        "tables, footers, numbers, and special characters."
                     )
                 }
             ]
@@ -150,71 +141,157 @@ def ocr_image(image: Image.Image, max_tokens: int = 1500) -> str:
     inputs = processor(
         text=[prompt],
         images=[image],
-        return_tensors="pt"
-    ).to(DEVICE)
+        return_tensors="pt",
+        padding=True
+    ).to(DEVICE, non_blocking=True)  # Non-blocking transfer
 
-    # Use automatic mixed precision
-    with torch.cuda.amp.autocast(dtype=torch.float16):
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=max_tokens,
-            temperature=0.0,
-            do_sample=False,
-            num_beams=1,
-            pad_token_id=processor.tokenizer.pad_token_id,
-            eos_token_id=processor.tokenizer.eos_token_id,
-        )
+    # Optimized generation parameters
+    output_ids = model.generate(
+        **inputs,
+        max_new_tokens=1024,  # Reduced from 1200
+        temperature=0.1,
+        do_sample=False,  # Greedy decoding is faster
+        num_beams=1,  # Disable beam search for speed
+        use_cache=True,  # Enable KV cache
+        pad_token_id=processor.tokenizer.pad_token_id,
+        eos_token_id=processor.tokenizer.eos_token_id
+    )
 
     decoded = processor.batch_decode(
         output_ids,
-        skip_special_tokens=True
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=True
     )[0]
 
-    # Clean output
+    # Clean up the response
     if "assistant" in decoded:
         decoded = decoded.split("assistant", 1)[-1]
 
     decoded = decoded.strip()
-    while decoded.startswith(("system\n", "user\n", ".")):
-        decoded = decoded.split("\n", 1)[-1].strip()
-
-    decoded = decoded.replace("assistant\n", "", 1).strip()
+    
+    # Remove system/user prefixes
+    for prefix in ["system\n", "user\n", "."]:
+        if decoded.startswith(prefix):
+            decoded = decoded.split("\n", 1)[-1].strip()
 
     return decoded
+
+
+# ===============================
+# BATCH PROCESSING (NEW)
+# ===============================
+@torch.inference_mode()
+def ocr_batch(images: list[Image.Image]) -> list[str]:
+    """Process multiple pages in a single batch for better GPU utilization"""
+    if len(images) == 1:
+        return [ocr_page(images[0])]
+    
+    # For small batches, process together
+    batch_size = min(4, len(images))  # RTX 4090 can handle 4 pages
+    results = []
+    
+    for i in range(0, len(images), batch_size):
+        batch = images[i:i+batch_size]
+        
+        messages_list = []
+        for _ in batch:
+            messages_list.append([
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {
+                            "type": "text",
+                            "text": "Extract all text from this document including headers, tables, footers, numbers, and special characters."
+                        }
+                    ]
+                }
+            ])
+        
+        prompts = [processor.apply_chat_template(m, add_generation_prompt=True) for m in messages_list]
+        
+        inputs = processor(
+            text=prompts,
+            images=batch,
+            return_tensors="pt",
+            padding=True
+        ).to(DEVICE, non_blocking=True)
+        
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=1024,
+            temperature=0.1,
+            do_sample=False,
+            num_beams=1,
+            use_cache=True,
+            pad_token_id=processor.tokenizer.pad_token_id,
+            eos_token_id=processor.tokenizer.eos_token_id
+        )
+        
+        decoded_batch = processor.batch_decode(
+            output_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=True
+        )
+        
+        for decoded in decoded_batch:
+            if "assistant" in decoded:
+                decoded = decoded.split("assistant", 1)[-1]
+            decoded = decoded.strip()
+            for prefix in ["system\n", "user\n", "."]:
+                if decoded.startswith(prefix):
+                    decoded = decoded.split("\n", 1)[-1].strip()
+            results.append(decoded)
+    
+    return results
 
 
 # ===============================
 # HANDLER
 # ===============================
 def handler(event):
-    try:
-        load_model()
+    load_model()
 
-        input_data = event.get("input", {})
-        
-        if "image" not in input_data:
+    PREFIX = (
+        "Return the COMPLETE plain text of this document from top to bottom, "
+        "including headers, tables, footers, bank details, signatures, stamps, "
+        "emails, phone numbers, and all numbers exactly as written.\nassistant\n"
+    )
+
+    try:
+        if "image" in event["input"]:
+            pages = [decode_image(event["input"]["image"])]
+        elif "file" in event["input"]:
+            pages = decode_pdf(event["input"]["file"])
+        else:
             return {
                 "status": "error",
-                "message": "Missing 'image' field in input"
+                "message": "Missing image or file"
             }
 
-        max_tokens = input_data.get("max_tokens", 1500)
-        
-        image = decode_image(input_data["image"])
-        text = ocr_image(image, max_tokens=max_tokens)
+        # Use batch processing for better performance
+        if len(pages) > 1:
+            texts = ocr_batch(pages)
+            extracted_pages = [
+                {"page": i, "text": text.replace(PREFIX, "", 1)}
+                for i, text in enumerate(texts, start=1)
+            ]
+        else:
+            text = ocr_page(pages[0])
+            extracted_pages = [{"page": 1, "text": text.replace(PREFIX, "", 1)}]
 
-        gpu_memory = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0
+        # Clear cache after processing
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         return {
             "status": "success",
-            "text": text,
-            "gpu_memory_gb": round(gpu_memory, 2)
+            "total_pages": len(extracted_pages),
+            "pages": extracted_pages
         }
     
     except Exception as e:
         log(f"Error: {str(e)}")
-        import traceback
-        traceback.print_exc()
         return {
             "status": "error",
             "message": str(e)
@@ -222,13 +299,21 @@ def handler(event):
 
 
 # ===============================
-# PRELOAD
+# PRELOAD & WARMUP
 # ===============================
-log("="*60)
-log("RTX 4090 OCR HANDLER - PyTorch 2.4.0")
-log("="*60)
+log("Preloading model...")
 load_model()
-log("Handler ready for requests!")
+
+# Warmup run for optimal performance
+if torch.cuda.is_available():
+    log("Running warmup...")
+    dummy_image = Image.new('RGB', (1280, 1600), color='white')
+    try:
+        _ = ocr_page(dummy_image)
+        torch.cuda.empty_cache()
+        log("Warmup complete")
+    except Exception as e:
+        log(f"Warmup failed: {e}")
 
 runpod.serverless.start({
     "handler": handler
