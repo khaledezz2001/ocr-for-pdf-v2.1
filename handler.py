@@ -7,7 +7,7 @@ from PIL import Image
 from transformers import AutoProcessor, AutoModelForImageTextToText
 
 # ===============================
-# OFFLINE MODE (RUNTIME)
+# OFFLINE MODE (RUNTIME )
 # ===============================
 os.environ["HF_HOME"] = "/models/hf"
 os.environ["TRANSFORMERS_CACHE"] = "/models/hf"
