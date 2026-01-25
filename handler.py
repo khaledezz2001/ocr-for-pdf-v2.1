@@ -255,17 +255,7 @@ def handler(event):
 
     # Prefix to remove from output
     PREFIX = (
-        ".\nuser\nYou are a professional OCR system. Extract ALL text from this document EXACTLY as written. Include:\n"
-        "- All headers, titles, and sections\n"
-        "- All body text and paragraphs\n"
-        "- All tables with correct alignment\n"
-        "- All numbers, dates, and codes EXACTLY as shown\n"
-        "- All names, addresses, and contact information\n"
-        "- All signatures, stamps, and annotations\n"
-        "- Preserve original spelling and formatting\n"
-        "- Do NOT correct typos or translate anything\n"
-        "- Do NOT add interpretations or summaries\n"
-        "Return ONLY the extracted text, nothing else.\nassistant\n"
+        ".\nuser\nYou are a professional OCR system. Extract ALL text from this document EXACTLY as written. Include:\n- All headers, titles, and sections\n- All body text and paragraphs\n- All tables with correct alignment\n- All numbers, dates, and codes EXACTLY as shown\n- All names, addresses, and contact information\n- All signatures, stamps, and annotations\n- Preserve original spelling and formatting\n\nCRITICAL RULES:\n- Do NOT correct typos or translate anything\n- Do NOT add interpretations or summaries\n- Do NOT make up content if the page is blank or empty\n- If the page is truly empty, output only: EMPTY_PAGE\n- Do NOT create tables, examples, or sample data\n\nReturn ONLY the extracted text, nothing else.\nassistant\n
     )
 
     try:
