@@ -20,6 +20,11 @@ os.environ["HF_HUB_DISABLE_XET"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # ===============================
+# MEMORY OPTIMIZATION
+# ===============================
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
+# ===============================
 # CONFIG
 # ===============================
 MODEL_PATH = "/models/hf/reducto/RolmOCR"
@@ -51,11 +56,11 @@ def is_hallucinated_output(text: str) -> bool:
     if not text or len(text.strip()) < 10:
         return True
     
-    # Check for repetitive table patterns (like page 13)
+    # Check for repetitive table patterns
     lines = text.strip().split('\n')
     if len(lines) > 20:
         unique_lines = set(line.strip() for line in lines if line.strip())
-        if len(unique_lines) < 3:  # Too repetitive
+        if len(unique_lines) < 3:
             return True
     
     # Check for excessive markdown tables with no content
@@ -72,13 +77,13 @@ def is_hallucinated_output(text: str) -> bool:
 
 
 # ===============================
-# IMAGE DECODING (ACCURACY OPTIMIZED)
+# IMAGE DECODING (MEMORY BALANCED)
 # ===============================
 def decode_image(b64):
     img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
 
-    # Higher resolution for better accuracy
-    target_width = 1920
+    # Balanced resolution for RTX 4090
+    target_width = 1600
     scale = target_width / img.width
     img = img.resize(
         (target_width, int(img.height * scale)),
@@ -91,7 +96,7 @@ def decode_pdf(b64):
     pdf_bytes = base64.b64decode(b64)
     images = convert_from_bytes(
         pdf_bytes,
-        dpi=200,  # Increased for better quality
+        dpi=150,
         fmt="png",
         thread_count=4,
         use_pdftocairo=True
@@ -127,7 +132,7 @@ def load_model():
 
 
 # ===============================
-# OCR ONE PAGE (ACCURACY OPTIMIZED)
+# OCR ONE PAGE
 # ===============================
 def ocr_page(image: Image.Image) -> str:
     messages = [
@@ -171,12 +176,12 @@ def ocr_page(image: Image.Image) -> str:
     with torch.inference_mode():
         output_ids = model.generate(
             **inputs,
-            max_new_tokens=2048,      # Increased for long documents
+            max_new_tokens=1536,      # Balanced for memory
             min_new_tokens=10,
-            temperature=0.0,          # Deterministic (no hallucination)
+            temperature=0.0,          # No hallucination
             do_sample=False,
             num_beams=1,
-            repetition_penalty=1.1,   # Reduce repetition
+            repetition_penalty=1.1,
             use_cache=True,
             pad_token_id=processor.tokenizer.pad_token_id,
             eos_token_id=processor.tokenizer.eos_token_id
@@ -202,9 +207,19 @@ def ocr_page(image: Image.Image) -> str:
 def handler(event):
     load_model()
 
-    # All known prefixes that need to be removed
-    PREFIXES_TO_REMOVE = (
-        ".\nuser\nYou are a professional OCR system. Extract ALL text from this document EXACTLY as written. Include:\n- All headers, titles, and sections\n- All body text and paragraphs\n- All tables with correct alignment\n- All numbers, dates, and codes EXACTLY as shown\n- All names, addresses, and contact information\n- All signatures, stamps, and annotations\n- Preserve original spelling and formatting\n- Do NOT correct typos or translate anything\n- Do NOT add interpretations or summaries\nReturn ONLY the extracted text, nothing else.\nassistant\n"
+    # Prefix to remove from output
+    PREFIX = (
+        ".\nuser\nYou are a professional OCR system. Extract ALL text from this document EXACTLY as written. Include:\n"
+        "- All headers, titles, and sections\n"
+        "- All body text and paragraphs\n"
+        "- All tables with correct alignment\n"
+        "- All numbers, dates, and codes EXACTLY as shown\n"
+        "- All names, addresses, and contact information\n"
+        "- All signatures, stamps, and annotations\n"
+        "- Preserve original spelling and formatting\n"
+        "- Do NOT correct typos or translate anything\n"
+        "- Do NOT add interpretations or summaries\n"
+        "Return ONLY the extracted text, nothing else.\nassistant\n"
     )
 
     try:
@@ -223,10 +238,8 @@ def handler(event):
         for i, page in enumerate(pages, start=1):
             text = ocr_page(page)
             
-            # Remove all known prefixes
-            
-            
-            
+            # Remove prefix
+            text = text.replace(PREFIX, "", 1).strip()
             
             # Detect hallucinations
             if is_hallucinated_output(text):
@@ -235,12 +248,12 @@ def handler(event):
             
             extracted_pages.append({
                 "page": i,
-                "text": text.replace(PREFIX, "", 1)
+                "text": text
             })
-
-        # Clear GPU cache
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            
+            # Clear cache after each page to prevent OOM
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         return {
             "status": "success",
@@ -264,10 +277,10 @@ def handler(event):
 log("Preloading model...")
 load_model()
 
-# Warmup for optimal performance
+# Warmup with smaller image
 if torch.cuda.is_available():
     log("Running warmup...")
-    dummy_image = Image.new('RGB', (1920, 1600), color='white')
+    dummy_image = Image.new('RGB', (1600, 1200), color='white')
     try:
         _ = ocr_page(dummy_image)
         torch.cuda.empty_cache()
