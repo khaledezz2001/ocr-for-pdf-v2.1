@@ -7,6 +7,5 @@ huggingface_hub>=0.26.0
 protobuf
 numpy<2.0
 runpod
-flash-attn>=2.7.0  # For Flash Attention 2 speedup
-sentencepiece  # Often needed for tokenizers
-einops  # Common dependency
+sentencepiece
+einops
