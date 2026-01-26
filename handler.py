@@ -29,7 +29,7 @@ os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 # ===============================
 MODEL_PATH = "/models/hf/reducto/RolmOCR"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-MAX_PAGES = 20
+MAX_PAGES = 30
 
 processor = None
 model = None
