@@ -42,6 +42,9 @@ COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Flash Attention 2 for faster inference (optional — falls back gracefully)
+RUN pip install --no-cache-dir flash-attn --no-build-isolation || echo "Flash Attention 2 build failed, will use default attention"
+
 # -------------------------------
 # MODEL DOWNLOAD (BUILD TIME)
 # -------------------------------
