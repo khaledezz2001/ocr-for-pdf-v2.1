@@ -1,6 +1,7 @@
 import os
 import base64
 import io
+import time
 import torch
 import runpod
 from PIL import Image
@@ -34,8 +35,36 @@ MAX_PAGES = 100
 processor = None
 model = None
 
+
+def get_optimal_batch_size():
+    """Auto-detect the best batch size based on GPU VRAM."""
+    if not torch.cuda.is_available():
+        return 1  # CPU — process one at a time
+
+    vram_gb = torch.cuda.get_device_properties(0).total_mem / (1024 ** 3)
+    gpu_name = torch.cuda.get_device_name(0)
+
+    if vram_gb >= 70:      # A100 80GB, H100 80GB
+        batch = 8
+    elif vram_gb >= 40:    # A40 48GB, A100 40GB, A6000 48GB
+        batch = 6
+    elif vram_gb >= 28:    # RTX 5090 32GB
+        batch = 5
+    elif vram_gb >= 20:    # RTX 4090 24GB, RTX 3090 24GB, A5000 24GB
+        batch = 4
+    elif vram_gb >= 14:    # RTX 4080 16GB, T4 16GB, V100 16GB
+        batch = 2
+    else:                  # Smaller GPUs
+        batch = 1
+
+    print(f"[BOOT] GPU: {gpu_name} ({vram_gb:.1f} GB VRAM) → BATCH_SIZE={batch}", flush=True)
+    return batch
+
+
+BATCH_SIZE = get_optimal_batch_size()
+
 # ===============================
-# RTX 4090 OPTIMIZATIONS
+# GPU OPTIMIZATIONS
 # ===============================
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -119,12 +148,12 @@ def is_hallucinated_output(text: str) -> bool:
 
 
 # ===============================
-# IMAGE DECODING (MEMORY BALANCED)
+# IMAGE DECODING (SAME QUALITY)
 # ===============================
 def decode_image(b64):
     img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
 
-    # Balanced resolution for RTX 4090
+    # Balanced resolution — UNCHANGED to preserve quality
     target_width = 1600
     scale = target_width / img.width
     img = img.resize(
@@ -161,60 +190,109 @@ def load_model():
     )
 
     log("Loading model...")
-    model = AutoModelForImageTextToText.from_pretrained(
-        MODEL_PATH,
-        device_map="auto",
-        torch_dtype=torch.float16,
-        local_files_only=True,
-        low_cpu_mem_usage=True
-    )
+    
+    # Determine best dtype for the GPU
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0).lower()
+        # A40, A100, H100, RTX 30xx/40xx support BF16 natively
+        if torch.cuda.is_bf16_supported():
+            dtype = torch.bfloat16
+            log("Using BF16 (native support)")
+        else:
+            dtype = torch.float16
+            log("Using FP16")
+    else:
+        dtype = torch.float32
+    
+    # Try loading with Flash Attention 2 for faster inference
+    try:
+        model = AutoModelForImageTextToText.from_pretrained(
+            MODEL_PATH,
+            device_map="auto",
+            torch_dtype=dtype,
+            local_files_only=True,
+            low_cpu_mem_usage=True,
+            attn_implementation="flash_attention_2"
+        )
+        log("Loaded with Flash Attention 2")
+    except Exception as e:
+        log(f"Flash Attention 2 not available ({e}), using default attention")
+        model = AutoModelForImageTextToText.from_pretrained(
+            MODEL_PATH,
+            device_map="auto",
+            torch_dtype=dtype,
+            local_files_only=True,
+            low_cpu_mem_usage=True
+        )
 
     model.eval()
+    
+    # Try torch.compile for kernel fusion (speeds up repeated calls)
+    try:
+        model = torch.compile(model, mode="reduce-overhead")
+        log("Model compiled with torch.compile")
+    except Exception as e:
+        log(f"torch.compile not available ({e}), using eager mode")
+    
     log("RolmOCR model loaded")
 
 
 # ===============================
-# OCR ONE PAGE
+# OCR PROMPT (cached once)
 # ===============================
-def ocr_page(image: Image.Image) -> str:
-    messages = [
+OCR_PROMPT_TEXT = (
+    "You are a professional OCR system. Extract ALL text from this document "
+    "EXACTLY as written. Include:\n"
+    "- All headers, titles, and sections\n"
+    "- All body text and paragraphs\n"
+    "- All tables with correct alignment\n"
+    "- All numbers, dates, and codes EXACTLY as shown\n"
+    "- All names, addresses, and contact information\n"
+    "- All signatures, stamps, and annotations\n"
+    "- Preserve original spelling and formatting\n\n"
+    "CRITICAL RULES:\n"
+    "- Do NOT correct typos or translate anything\n"
+    "- Do NOT add interpretations or summaries\n"
+    "- Do NOT make up content if the page is blank or empty\n"
+    "- If the page is truly empty, output only: EMPTY_PAGE\n"
+    "- Do NOT create tables, examples, or sample data\n\n"
+    "Return ONLY the extracted text, nothing else."
+)
+
+
+def build_messages_for_image():
+    """Build the chat messages for a single image — reused for every page."""
+    return [
         {
             "role": "user",
             "content": [
                 {"type": "image"},
-                {
-                    "type": "text",
-                    "text": (
-                        "You are a professional OCR system. Extract ALL text from this document "
-                        "EXACTLY as written. Include:\n"
-                        "- All headers, titles, and sections\n"
-                        "- All body text and paragraphs\n"
-                        "- All tables with correct alignment\n"
-                        "- All numbers, dates, and codes EXACTLY as shown\n"
-                        "- All names, addresses, and contact information\n"
-                        "- All signatures, stamps, and annotations\n"
-                        "- Preserve original spelling and formatting\n\n"
-                        "CRITICAL RULES:\n"
-                        "- Do NOT correct typos or translate anything\n"
-                        "- Do NOT add interpretations or summaries\n"
-                        "- Do NOT make up content if the page is blank or empty\n"
-                        "- If the page is truly empty, output only: EMPTY_PAGE\n"
-                        "- Do NOT create tables, examples, or sample data\n\n"
-                        "Return ONLY the extracted text, nothing else."
-                    )
-                }
+                {"type": "text", "text": OCR_PROMPT_TEXT}
             ]
         }
     ]
 
-    prompt = processor.apply_chat_template(
-        messages,
-        add_generation_prompt=True
-    )
 
+# ===============================
+# BATCH OCR — process multiple pages at once
+# ===============================
+def ocr_batch(images: list) -> list:
+    """Process a batch of images in a single model.generate() call."""
+    
+    # Build prompts for all images in the batch
+    prompts = []
+    for _ in images:
+        messages = build_messages_for_image()
+        prompt = processor.apply_chat_template(
+            messages,
+            add_generation_prompt=True
+        )
+        prompts.append(prompt)
+
+    # Process all images at once
     inputs = processor(
-        text=[prompt],
-        images=[image],
+        text=prompts,
+        images=images,
         return_tensors="pt",
         padding=True
     ).to(DEVICE, non_blocking=True)
@@ -222,9 +300,9 @@ def ocr_page(image: Image.Image) -> str:
     with torch.inference_mode():
         output_ids = model.generate(
             **inputs,
-            max_new_tokens=1536,      # Balanced for memory
+            max_new_tokens=1536,
             min_new_tokens=10,
-            temperature=0.0,          # No hallucination
+            temperature=0.0,
             do_sample=False,
             num_beams=1,
             repetition_penalty=1.1,
@@ -233,18 +311,22 @@ def ocr_page(image: Image.Image) -> str:
             eos_token_id=processor.tokenizer.eos_token_id
         )
 
-    decoded = processor.batch_decode(
+    # Decode all outputs
+    decoded_list = processor.batch_decode(
         output_ids,
         skip_special_tokens=True,
         clean_up_tokenization_spaces=False
-    )[0]
+    )
 
-    # Clean up response
-    if "assistant" in decoded.lower():
-        idx = decoded.lower().index("assistant") + len("assistant")
-        decoded = decoded[idx:]
+    # Clean up each response
+    results = []
+    for decoded in decoded_list:
+        if "assistant" in decoded.lower():
+            idx = decoded.lower().index("assistant") + len("assistant")
+            decoded = decoded[idx:]
+        results.append(decoded.strip())
 
-    return decoded.strip()
+    return results
 
 
 # ===============================
@@ -254,8 +336,7 @@ def handler(event):
     load_model()
 
     # Prefix to remove from output
-    PREFIX =".\nuser\nYou are a professional OCR system. Extract ALL text from this document EXACTLY as written. Include:\n- All headers, titles, and sections\n- All body text and paragraphs\n- All tables with correct alignment\n- All numbers, dates, and codes EXACTLY as shown\n- All names, addresses, and contact information\n- All signatures, stamps, and annotations\n- Preserve original spelling and formatting\n\nCRITICAL RULES:\n- Do NOT correct typos or translate anything\n- Do NOT add interpretations or summaries\n- Do NOT make up content if the page is blank or empty\n- If the page is truly empty, output only: EMPTY_PAGE\n- Do NOT create tables, examples, or sample data\n\nReturn ONLY the extracted text, nothing else.\nassistant\n"
-    
+    PREFIX = ".\nuser\n" + OCR_PROMPT_TEXT + "\nassistant\n"
 
     try:
         if "image" in event["input"]:
@@ -268,30 +349,47 @@ def handler(event):
                 "message": "Missing image or file"
             }
 
+        total_pages = len(pages)
+        log(f"Processing {total_pages} pages in batches of {BATCH_SIZE}...")
+        start_time = time.time()
+
         extracted_pages = []
 
-        for i, page in enumerate(pages, start=1):
-            text = ocr_page(page)
+        # Process pages in batches instead of one-by-one
+        for batch_start in range(0, total_pages, BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, total_pages)
+            batch_images = pages[batch_start:batch_end]
             
-            # Remove prefix
-            text = text.replace(PREFIX, "", 1).strip()
+            log(f"Processing batch: pages {batch_start + 1}-{batch_end} of {total_pages}")
             
-            # Check if model explicitly said it's empty
-            if text.upper() == "EMPTY_PAGE" or text.upper().startswith("EMPTY_PAGE"):
-                text = "[Empty or unreadable page]"
-            # Detect hallucinations
-            elif is_hallucinated_output(text):
-                log(f"Warning: Page {i} appears to be hallucinated")
-                text = "[Empty or unreadable page]"
+            # Run OCR on the entire batch at once
+            batch_results = ocr_batch(batch_images)
             
-            extracted_pages.append({
-                "page": i,
-                "text": text
-            })
+            for j, text in enumerate(batch_results):
+                page_num = batch_start + j + 1
+                
+                # Remove prefix
+                text = text.replace(PREFIX, "", 1).strip()
+                
+                # Check if model explicitly said it's empty
+                if text.upper() == "EMPTY_PAGE" or text.upper().startswith("EMPTY_PAGE"):
+                    text = "[Empty or unreadable page]"
+                # Detect hallucinations
+                elif is_hallucinated_output(text):
+                    log(f"Warning: Page {page_num} appears to be hallucinated")
+                    text = "[Empty or unreadable page]"
+                
+                extracted_pages.append({
+                    "page": page_num,
+                    "text": text
+                })
             
-            # Clear cache after each page to prevent OOM
+            # Clear cache between batches (not between every page)
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+        elapsed = time.time() - start_time
+        log(f"Completed {total_pages} pages in {elapsed:.1f}s ({elapsed/total_pages:.1f}s/page)")
 
         return {
             "status": "success",
@@ -320,7 +418,7 @@ if torch.cuda.is_available():
     log("Running warmup...")
     dummy_image = Image.new('RGB', (1600, 1200), color='white')
     try:
-        _ = ocr_page(dummy_image)
+        _ = ocr_batch([dummy_image])
         torch.cuda.empty_cache()
         log("Warmup complete")
     except Exception as e:
