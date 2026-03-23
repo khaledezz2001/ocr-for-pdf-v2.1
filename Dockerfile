@@ -1,4 +1,4 @@
-FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
+FROM runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404
 
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
@@ -14,7 +14,7 @@ ENV HF_HUB_DISABLE_XET=1
 ENV TOKENIZERS_PARALLELISM=false
 
 # -------------------------------
-# CUDA OPTIMIZATIONS FOR RTX 4090
+# CUDA OPTIMIZATIONS
 # -------------------------------
 ENV CUDA_VISIBLE_DEVICES=0
 ENV CUDA_LAUNCH_BLOCKING=0
