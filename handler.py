@@ -41,7 +41,7 @@ def get_optimal_batch_size():
     if not torch.cuda.is_available():
         return 1  # CPU — process one at a time
 
-    vram_gb = torch.cuda.get_device_properties(0).total_mem / (1024 ** 3)
+    vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
     gpu_name = torch.cuda.get_device_name(0)
 
     if vram_gb >= 70:      # A100 80GB, H100 80GB
