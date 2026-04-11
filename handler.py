@@ -242,21 +242,36 @@ def load_model():
 # ===============================
 OCR_PROMPT_TEXT = (
     "You are a professional OCR system. Extract ALL text from this document "
-    "EXACTLY as written. Include:\n"
-    "- All headers, titles, and sections\n"
-    "- All body text and paragraphs\n"
-    "- All tables with correct alignment\n"
-    "- All numbers, dates, and codes EXACTLY as shown\n"
-    "- All names, addresses, and contact information\n"
-    "- All signatures, stamps, and annotations\n"
+    "EXACTLY as written.\n\n"
+
+    "INSTRUCTIONS:\n"
+    "- Return the output as MARKDOWN format\n"
+    "- Include a FRONT MATTER section at the top with the following fields:\n"
+    "  primary_language:\n"
+    "  is_rotation_valid:\n"
+    "  rotation_correction:\n"
+    "  is_table:\n"
+    "  is_diagram:\n\n"
+
+    "- Extract all headers, titles, and sections\n"
+    "- Extract all body text and paragraphs\n"
+    "- Extract all numbers, dates, and codes EXACTLY as shown\n"
+    "- Extract all names, addresses, and contact information\n"
+    "- Extract all signatures, stamps, and annotations\n"
     "- Preserve original spelling and formatting\n\n"
+
+    "SPECIAL FORMATTING RULES:\n"
+    "- Convert equations to LaTeX\n"
+    "- Convert tables to HTML (preserve structure and alignment)\n"
+    "- If there are figures or charts, represent them using this markdown format:\n"
+    "  ![Alt text describing the contents of the figure](page_startx_starty_width_height.png)\n\n"
+
     "CRITICAL RULES:\n"
     "- Do NOT correct typos or translate anything\n"
     "- Do NOT add interpretations or summaries\n"
     "- Do NOT make up content if the page is blank or empty\n"
     "- If the page is truly empty, output only: EMPTY_PAGE\n"
-    "- Do NOT create tables, examples, or sample data\n\n"
-    "Return ONLY the extracted text, nothing else."
+    "- Return ONLY the extracted content in markdown format\n"
 )
 
 
