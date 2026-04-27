@@ -1,4 +1,5 @@
 import os
+import gc
 import base64
 import io
 import time
@@ -36,28 +37,43 @@ processor = None
 model = None
 
 
+def get_free_vram_gb():
+    """Get the amount of FREE VRAM in GB (not total)."""
+    if not torch.cuda.is_available():
+        return 0
+    free, total = torch.cuda.mem_get_info(0)
+    return free / (1024 ** 3)
+
+
 def get_optimal_batch_size():
-    """Auto-detect the best batch size based on GPU VRAM."""
+    """Auto-detect the best batch size based on FREE GPU VRAM (not total)."""
     if not torch.cuda.is_available():
         return 1  # CPU — process one at a time
 
-    vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    total_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    free_gb = get_free_vram_gb()
     gpu_name = torch.cuda.get_device_name(0)
 
-    if vram_gb >= 70:      # A100 80GB, H100 80GB
+    print(f"[BOOT] GPU: {gpu_name} | Total: {total_gb:.1f} GB | Free: {free_gb:.1f} GB", flush=True)
+
+    # Warn if another process is using significant VRAM
+    used_by_others = total_gb - free_gb
+    if used_by_others > 2.0:
+        print(f"[BOOT] WARNING: {used_by_others:.1f} GB already in use by other processes!", flush=True)
+
+    # Size batch based on AVAILABLE (free) memory, not total
+    if free_gb >= 60:       # Plenty of room
         batch = 8
-    elif vram_gb >= 40:    # A40 48GB, A100 40GB, A6000 48GB
+    elif free_gb >= 35:     # Comfortable
         batch = 6
-    elif vram_gb >= 28:    # RTX 5090 32GB
-        batch = 5
-    elif vram_gb >= 20:    # RTX 4090 24GB, RTX 3090 24GB, A5000 24GB
+    elif free_gb >= 25:     # Moderate
         batch = 4
-    elif vram_gb >= 14:    # RTX 4080 16GB, T4 16GB, V100 16GB
+    elif free_gb >= 15:     # Tight
         batch = 2
-    else:                  # Smaller GPUs
+    else:                   # Very limited
         batch = 1
 
-    print(f"[BOOT] GPU: {gpu_name} ({vram_gb:.1f} GB VRAM) → BATCH_SIZE={batch}", flush=True)
+    print(f"[BOOT] BATCH_SIZE={batch} (based on {free_gb:.1f} GB free VRAM)", flush=True)
     return batch
 
 
@@ -228,11 +244,17 @@ def load_model():
     model.eval()
     
     # Try torch.compile for kernel fusion (speeds up repeated calls)
+    # NOTE: "reduce-overhead" uses CUDA graphs which pre-allocate large memory.
+    # Use "max-autotune" instead for better memory efficiency.
     try:
-        model = torch.compile(model, mode="reduce-overhead")
-        log("Model compiled with torch.compile")
+        model = torch.compile(model, mode="max-autotune")
+        log("Model compiled with torch.compile (max-autotune)")
     except Exception as e:
         log(f"torch.compile not available ({e}), using eager mode")
+    
+    # Recalculate batch size now that model is loaded and occupying VRAM
+    global BATCH_SIZE
+    BATCH_SIZE = get_optimal_batch_size()
     
     log("RolmOCR model loaded")
 
@@ -242,36 +264,21 @@ def load_model():
 # ===============================
 OCR_PROMPT_TEXT = (
     "You are a professional OCR system. Extract ALL text from this document "
-    "EXACTLY as written.\n\n"
-
-    "INSTRUCTIONS:\n"
-    "- Return the output as MARKDOWN format\n"
-    "- Include a FRONT MATTER section at the top with the following fields:\n"
-    "  primary_language:\n"
-    "  is_rotation_valid:\n"
-    "  rotation_correction:\n"
-    "  is_table:\n"
-    "  is_diagram:\n\n"
-
-    "- Extract all headers, titles, and sections\n"
-    "- Extract all body text and paragraphs\n"
-    "- Extract all numbers, dates, and codes EXACTLY as shown\n"
-    "- Extract all names, addresses, and contact information\n"
-    "- Extract all signatures, stamps, and annotations\n"
+    "EXACTLY as written. Include:\n"
+    "- All headers, titles, and sections\n"
+    "- All body text and paragraphs\n"
+    "- All tables with correct alignment\n"
+    "- All numbers, dates, and codes EXACTLY as shown\n"
+    "- All names, addresses, and contact information\n"
+    "- All signatures, stamps, and annotations\n"
     "- Preserve original spelling and formatting\n\n"
-
-    "SPECIAL FORMATTING RULES:\n"
-    "- Convert equations to LaTeX\n"
-    "- Convert tables to HTML (preserve structure and alignment)\n"
-    "- If there are figures or charts, represent them using this markdown format:\n"
-    "  ![Alt text describing the contents of the figure](page_startx_starty_width_height.png)\n\n"
-
     "CRITICAL RULES:\n"
     "- Do NOT correct typos or translate anything\n"
     "- Do NOT add interpretations or summaries\n"
     "- Do NOT make up content if the page is blank or empty\n"
     "- If the page is truly empty, output only: EMPTY_PAGE\n"
-    "- Return ONLY the extracted content in markdown format\n"
+    "- Do NOT create tables, examples, or sample data\n\n"
+    "Return ONLY the extracted text, nothing else."
 )
 
 
@@ -326,12 +333,20 @@ def ocr_batch(images: list) -> list:
             eos_token_id=processor.tokenizer.eos_token_id
         )
 
+    # Free input tensors immediately
+    del inputs
+    torch.cuda.empty_cache()
+
     # Decode all outputs
     decoded_list = processor.batch_decode(
         output_ids,
         skip_special_tokens=True,
         clean_up_tokenization_spaces=False
     )
+
+    # Free output IDs
+    del output_ids
+    torch.cuda.empty_cache()
 
     # Clean up each response
     results = []
@@ -370,15 +385,49 @@ def handler(event):
 
         extracted_pages = []
 
+        # Dynamically adjust batch size based on current free VRAM
+        current_batch_size = BATCH_SIZE
+
         # Process pages in batches instead of one-by-one
-        for batch_start in range(0, total_pages, BATCH_SIZE):
-            batch_end = min(batch_start + BATCH_SIZE, total_pages)
+        for batch_start in range(0, total_pages, current_batch_size):
+            batch_end = min(batch_start + current_batch_size, total_pages)
             batch_images = pages[batch_start:batch_end]
             
-            log(f"Processing batch: pages {batch_start + 1}-{batch_end} of {total_pages}")
+            log(f"Processing batch: pages {batch_start + 1}-{batch_end} of {total_pages} (batch_size={len(batch_images)})")
             
-            # Run OCR on the entire batch at once
-            batch_results = ocr_batch(batch_images)
+            # Run OCR on the entire batch at once, with OOM retry
+            try:
+                batch_results = ocr_batch(batch_images)
+            except torch.cuda.OutOfMemoryError:
+                # OOM — clear cache, halve batch size, retry
+                log(f"OOM on batch of {len(batch_images)}! Clearing cache and retrying with smaller batch...")
+                torch.cuda.empty_cache()
+                gc.collect()
+                
+                # Halve the batch size (minimum 1)
+                current_batch_size = max(1, len(batch_images) // 2)
+                log(f"Reduced batch size to {current_batch_size}")
+                
+                # Re-process the failed batch in smaller sub-batches
+                batch_results = []
+                for sub_start in range(0, len(batch_images), current_batch_size):
+                    sub_batch = batch_images[sub_start:sub_start + current_batch_size]
+                    try:
+                        sub_results = ocr_batch(sub_batch)
+                        batch_results.extend(sub_results)
+                    except torch.cuda.OutOfMemoryError:
+                        log(f"OOM even at batch_size={len(sub_batch)}, falling back to single page")
+                        torch.cuda.empty_cache()
+                        gc.collect()
+                        for single_img in sub_batch:
+                            try:
+                                single_result = ocr_batch([single_img])
+                                batch_results.extend(single_result)
+                            except torch.cuda.OutOfMemoryError:
+                                log("FATAL: OOM even on single page. Skipping page.")
+                                torch.cuda.empty_cache()
+                                gc.collect()
+                                batch_results.append("[Error: insufficient GPU memory to process this page]")
             
             for j, text in enumerate(batch_results):
                 page_num = batch_start + j + 1
@@ -399,9 +448,11 @@ def handler(event):
                     "text": text
                 })
             
-            # Clear cache between batches (not between every page)
+            # Clear cache between batches
             if torch.cuda.is_available():
+                del batch_images
                 torch.cuda.empty_cache()
+                gc.collect()
 
         elapsed = time.time() - start_time
         log(f"Completed {total_pages} pages in {elapsed:.1f}s ({elapsed/total_pages:.1f}s/page)")
